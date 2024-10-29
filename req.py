@@ -70,7 +70,5 @@ def input_data(*args):
 
 if __name__ == "__main__":
     input_data(
-        'C0120040QM73440000',
-        'C0090040QM73438000',
-        'CONFIRM011672'
+
     )
