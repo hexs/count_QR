@@ -1,99 +1,27 @@
-from flask import Flask, render_template, Response, request, jsonify
+import time
+from datetime import datetime, timedelta
 import cv2
 import numpy as np
-
-app = Flask(__name__)
-
-click_position = None
-
-
-def gen_frames(data):
-    global click_position
-    while True:
-        img = data['img']
-
-        if img is None:
-            img = np.zeros((480, 640, 3), np.uint8)
-
-        if click_position:
-            cv2.putText(img, f'{click_position}', click_position, 1, 0.5, (0, 255, 0), 2)
-            click_position = None
-
-        ret, buffer = cv2.imencode('.jpg', img)
-        frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-
-@app.route('/')
-def index():
-    data = app.config['data']
-    count = {
-        'qr': 0,
-        'mark': 0,
-        'socket_qr_output': '-',
-        'socket_mk_output': '-',
-        'socket_rs_output': '-'
-    }
-    if data['count']:
-        count['qr'] = data['count'].get('0 qr', {}).get('count', 0)
-        count['mark'] = data['count'].get('1 mark', {}).get('count', 0)
-
-        data['socket_qr_output'] = data['count'].get('0 qr', {}).get('count', 0)
-        data['socket_mk_output'] = data['count'].get('1 mark', {}).get('count', 0)
-        data['socket_rs_output'] = count['qr'] if count['qr'] == count['mark'] else 'NG'
-    return render_template('index.html', count=count)
-
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(gen_frames(app.config['data']),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-@app.route('/click', methods=['POST'])
-def handle_click():
-    global click_position
-    data = request.json
-    click_position = (int(data['x']), int(data['y']))
-    return 'OK'
-
-
-@app.route('/get_counts')
-def get_counts():
-    data = app.config['data']
-    counts = {
-        'qr': data['count'].get('0 qr', {}).get('count', 0) if data['count'] else 0,
-        'mark': data['count'].get('1 mark', {}).get('count', 0) if data['count'] else 0,
-        'socket_qr_output': data['socket_qr_output'],
-        'socket_mk_output': data['socket_mk_output'],
-        'socket_rs_output': data['socket_rs_output'],
-        'socket_status': data['socket status'],
-        'count': data['count'] is not None
-    }
-    return jsonify(counts)
-
-
-def run_server(data):
-    app.config['data'] = data
-    ipv4 = data['config']['ipv4']
-    port = data['config']['webserver_port']
-    app.run(ipv4, port, debug=False, use_reloader=False)
+from hexss.json import json_load, json_update
 
 
 def capture(data):
     from hexss.image import get_image
     import time
-    import numpy as np
     import cv2
+    from random import randint
 
-    url = cv2.VideoCapture('241015-141410.mp4')
     url = data['config']['url_image']
     while data['play']:
         img = get_image(url)
+        if img is None:
+            img = np.full(
+                (480, 640, 3),
+                (randint(100, 255), randint(100, 255), randint(100, 255)),
+                np.uint8
+            )
+            cv2.putText(img, 'Error loading image from URL', (50, 100), 1, 2, (0, 0, 0), 2)
         data['img'] = img.copy()
-        # data['img'] = np.zeros(())
-        # (480, 640, 3) print(data['img'].shape)
         time.sleep(1 / 30)
 
 
@@ -108,19 +36,36 @@ def predict(data):
             data['count'] = detector.count
 
 
+def draw_elements(data):
+    colors = [(255, 0, 255), (0, 255, 255), (255, 255, 0)]
+    while data['play']:
+        img = data['img']
+        if img is None:
+            img = np.zeros((480, 640, 3), np.uint8)
+
+        for result in data['results']:
+            xyxy = result['xyxy']
+            cls = result['cls']
+            x1y1 = xyxy[:2].astype(int)
+            x2y2 = xyxy[2:].astype(int)
+            cv2.rectangle(img, tuple(x1y1), tuple(x2y2), colors[cls], 2)
+
+        data['show_img'] = img
+
+
+def close_port(ip, port):
+    import subprocess
+    try:
+        result = subprocess.run(
+            f'''for /f "tokens=5" %a in ('netstat -ano ^| findstr {ip}:{port}') do taskkill /F /PID %a''',
+            shell=True, capture_output=True, text=True)
+        print(result.stdout)
+    except Exception as e:
+        print(f"Error closing port: {e}")
+
+
 def sock(data):
     import socket
-    import time
-    import subprocess
-
-    def close_port(ip, port):
-        try:
-            result = subprocess.run(
-                f'''for /f "tokens=5" %a in ('netstat -ano ^| findstr {ip}:{port}') do taskkill /F /PID %a''',
-                shell=True, capture_output=True, text=True)
-            print(result.stdout)
-        except Exception as e:
-            print(f"Error closing port: {e}")
 
     while data['play']:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -128,11 +73,11 @@ def sock(data):
 
         while True:
             try:
-                server_socket.bind((data['config']['ipv4'], data['config']['socket_port_connect_PLC']))
+                server_socket.bind((data['config']['ipv4_connect_to_CHT'], data['config']['port_connect_to_PLC']))
                 break
             except OSError as e:
                 print(f"Binding failed: {e}")
-                close_port('192.168.225.137', 9000)
+                close_port(data['config']['ipv4_connect_to_CHT'], data['config']['port_connect_to_PLC'])
                 time.sleep(1)
 
         server_socket.listen(2)
@@ -140,29 +85,42 @@ def sock(data):
         conn, address = server_socket.accept()
         data['socket status'] = f"Connection from: {address}"
 
-        while True:
-            socket_data = conn.recv(1024)
-            print(socket_data)
-            print(socket_data.decode())
+        try:
+            while True:
+                socket_data = conn.recv(1024)
+                if not socket_data:
+                    break
 
-            if not socket_data:
-                data['socket status'] = "Connection closed"
-                break
+                qr = data['count']['0 qr']['count']
+                mark = data['count']['1 mark']['count']
 
-            qr = data['count'].get('0 qr', {}).get('count', 100)
-            mark = data['count'].get('1 mark', {}).get('count', 100)
-            num = qr if qr == mark else 100
+                if qr == mark:
+                    result = qr
+                    data['socket_rs_output'] = f'{qr}'
+                else:
+                    result = 100
+                    data['socket_rs_output'] = "NG"
 
-            data['socket_qr_output'] = data['count'].get('0 qr', {}).get('count', 0)
-            data['socket_mk_output'] = data['count'].get('1 mark', {}).get('count', 0)
-            data['socket_rs_output'] = "NG" if num >= 100 else num
-            conn.send(num.to_bytes(2, byteorder='little'))
-        conn.close()
-        server_socket.close()
+                data['socket_qr_output'] = qr
+                data['socket_mk_output'] = mark
+                conn.send(result.to_bytes(2, byteorder='little'))
+
+                now = datetime.now()
+                json_update(f'history/{now.strftime("%y%m%d")}.json', {
+                    f'{now.strftime("%H%M%S")}': {
+                        'qr': qr,
+                        'mark': mark,
+                        'result': data['socket_rs_output'],
+                    }
+                })
+
+        finally:
+            conn.close()
+            server_socket.close()
+            data['socket status'] = "Connection closed"
 
 
 def show(data):
-    import json
     import cv2
     from hexss.image.func import numpy_to_pygame_surface
     import pygame
@@ -179,21 +137,18 @@ def show(data):
     background.fill(manager.ui_theme.get_colour('dark_bg'))
 
     socket_status_label = UITextBox('-', Rect(0, 480, 640, 30), manager)
-
     qr_label = UITextBox('QR Code :', Rect(640, 0, 220, 30), manager)
     mk_label = UITextBox('Mark :', Rect(640, 30, 220, 30), manager)
-
     socket_qr_output_label = UITextBox('QR Code :', Rect(640, 420, 220, 30), manager)
     socket_mk_output_label = UITextBox('Mark :', Rect(640, 450, 220, 30), manager)
     socket_rs_output_label = UITextBox('Result :', Rect(640, 480, 220, 30), manager)
 
     rect = Rect(0, 0, 500, 120)
-    rect.center = (window_size[0] / 2, window_size[1] / 2)
+    rect.center = (window_size[0] // 2, window_size[1] // 2)
     loading_panel = UITextBox(f"<font color='#FFAA00' size=7>loading...</font><br>", rect, manager)
 
     clock = pygame.time.Clock()
     colors = [(255, 0, 255), (0, 255, 255), (255, 255, 0)]
-
     while data['play']:
         time_delta = clock.tick(60) / 1000.0
         for event in pygame.event.get():
@@ -234,20 +189,20 @@ def show(data):
 
 
 if __name__ == '__main__':
-    from hexss.multiprocessing import Multicore
+    from app import run_server
     import hexss
-    from hexss.json import json_load
+    from hexss.threading import Multithread
 
     config = json_load('config.json',
                        {
-                           "ipv4": hexss.get_ipv4(),
-                           "socket_port_connect_PLC": 9000,
-                           "webserver_port": 5555,
+                           'ipv4_connect_to_CHT': hexss.get_ipv4(),
+                           "port_connect_to_CHT": 5555,
+                           "ipv4_connect_to_PLC": hexss.get_ipv4(),
+                           "port_connect_to_PLC": 9000,
                            "url_image": 'http://192.168.123.122:2000/image?source=video_capture&id=0'
-
                        }, True)
-    m = Multicore()
-    m.set_data({
+
+    data = {
         'config': config,
         'play': True,
         'socket status': '-',
@@ -255,16 +210,23 @@ if __name__ == '__main__':
         'socket_mk_output': '-',
         'socket_rs_output': '-',
         'img': None,
+        'show_img': None,
         'results': [],
         'count': None
-    })
-    m.add_func(show)
-    m.add_func(predict)
-    m.add_func(capture)
-    m.add_func(sock, join=False)
-    m.add_func(run_server, join=False)
+    }
+    m = Multithread()
+    m.add_func(show, args=(data,))
+    m.add_func(predict, args=(data,))
+    m.add_func(capture, args=(data,))
+    m.add_func(sock, args=(data,), join=False)
+    m.add_func(run_server, args=(data,), join=False)
 
     m.start()
-    m.join()
-
-    hexss.kill()
+    try:
+        while data['play']:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        data['play'] = False
+        m.join()
