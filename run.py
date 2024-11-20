@@ -14,6 +14,10 @@ def capture(data):
     url = data['config']['url_image']
     while data['play']:
         img = get_image(url)
+        img[0:768,0:200] = np.zeros((768,200,3),np.uint8)
+        img[0:768,1024-150:1024] = np.zeros((768,150,3),np.uint8)
+
+
         if img is None:
             img = np.full(
                 (480, 640, 3),
